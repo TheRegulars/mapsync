@@ -11,4 +11,5 @@ FROM scratch
 COPY --from=builder /go/bin/mapsync /bin/mapsync
 COPY --from=builder /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/
 WORKDIR /
+USER 1000:1000
 ENTRYPOINT ["/bin/mapsync"]
