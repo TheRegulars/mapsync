@@ -177,13 +177,18 @@ func (s *SyncService) Start() {
 }
 
 func (s *SyncService) periodicSync() {
+	changesTicker := time.NewTicker(time.Second * 30)
+	defer changesTicker.Stop()
+	fullSyncTicker := time.NewTicker(time.Hour * 3)
+	defer fullSyncTicker.Stop()
+
 	for {
 		select {
-		case <-time.After(time.Second * 30):
+		case <-changesTicker.C:
 			if s.lastChange.IsZero() || time.Since(s.lastChange) < time.Second*90 {
 				// wait till there will 90 seconds after last change
 				// this will agregate multiple changes
-				// and will give time to undo changes
+				// and will give some time to undo changes
 				continue
 			}
 			s.changesMutex.Lock()
@@ -202,7 +207,7 @@ func (s *SyncService) periodicSync() {
 			if err := s.PartialSync(keys); err != nil {
 				s.logger.Printf("Failed partial sync: %v", err)
 			}
-		case <-time.After(time.Hour * 3):
+		case <-fullSyncTicker.C:
 			// full sync
 			if time.Since(s.lastFullSync) > 24*time.Hour && time.Since(s.lastSync) > 2*time.Hour {
 				if err := s.Sync(); err != nil {
