@@ -7,6 +7,7 @@ import (
 	"io/ioutil"
 	"log"
 	"math"
+	"math/rand/v2"
 	"os"
 	"path/filepath"
 	"sort"
@@ -99,6 +100,10 @@ func compareFileObjects(remoteObj *RemoteObjectInfo, localObj os.FileInfo) bool 
 }
 
 func NewSyncService(endpoint, bucket, region, prefix, path, queue, fifoPath string) *SyncService {
+	if prefix != "" && !strings.HasSuffix(prefix, "/") {
+		prefix += "/"
+	}
+
 	config := &aws.Config{
 		Region: aws.String(region),
 	}
@@ -372,56 +377,53 @@ func createSyncPlan(remoteObjects map[string]*RemoteObjectInfo,
 	return fileChanges
 }
 
+func createTempFile(filename string) (*os.File, error) {
+	dir, base := filepath.Split(filename)
+	for {
+		name := filepath.Join(dir, fmt.Sprintf(".%s.%d.tmp", base, rand.Uint32()))
+		file, err := os.OpenFile(name, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o666)
+		if os.IsExist(err) {
+			continue
+		}
+		return file, err
+	}
+}
+
+func downloadObject(downloader *s3manager.Downloader, task syncJob) (err error) {
+	file, err := createTempFile(task.filename)
+	if err != nil {
+		return err
+	}
+	defer func() {
+		if err != nil {
+			os.Remove(file.Name())
+		}
+	}()
+
+	_, err = downloader.Download(file, task.object)
+	closeErr := file.Close()
+	if err != nil {
+		return err
+	}
+	if closeErr != nil {
+		return closeErr
+	}
+	if err = os.Chtimes(file.Name(), time.Now(), task.mtime); err != nil {
+		return err
+	}
+	return os.Rename(file.Name(), task.filename)
+}
+
 func downloadObjectTask(downloader *s3manager.Downloader, jobs <-chan syncJob,
 	errors chan<- syncError, group *sync.WaitGroup,
 ) {
-	var update bool
-	var err error
-
 	for task := range jobs {
-		var file *os.File
-
-		if _, err = os.Stat(task.filename); os.IsNotExist(err) {
-			update = false
-			file, err = os.Create(task.filename)
-			if err != nil {
-				goto Error
+		if err := downloadObject(downloader, task); err != nil {
+			errors <- syncError{
+				key:      task.key,
+				filename: task.filename,
+				err:      err,
 			}
-		} else {
-			update = true
-			file, err = ioutil.TempFile(filepath.Dir(task.filename), filepath.Base(task.filename))
-			if err != nil {
-				goto Error
-			}
-		}
-
-		_, err = downloader.Download(file, task.object)
-		file.Close()
-
-		if err != nil {
-			if update {
-				// remove partially downloaded temporary file
-				os.Remove(file.Name())
-			}
-			goto Error
-		}
-
-		if update {
-			if err = os.Rename(file.Name(), task.filename); err != nil {
-				goto Error
-			}
-		}
-		err = os.Chtimes(task.filename, time.Now(), task.mtime)
-		if err != nil {
-			goto Error
-		}
-
-		continue
-	Error:
-		errors <- syncError{
-			key:      task.key,
-			filename: task.filename,
-			err:      err,
 		}
 	}
 	group.Done()
@@ -430,19 +432,32 @@ func downloadObjectTask(downloader *s3manager.Downloader, jobs <-chan syncJob,
 func (s *S3DownloadSync) localObjects() (map[string]os.FileInfo, error) {
 	localObjects := make(map[string]os.FileInfo)
 
-	// collect list of local objects
-	err := filepath.Walk(s.Path, func(path string, info os.FileInfo, err error) error {
+	// collect list of local objects, maps are only synced at the top level
+	entries, err := os.ReadDir(s.Path)
+	if err != nil {
+		return nil, err
+	}
+	for _, entry := range entries {
+		if entry.IsDir() {
+			continue
+		}
+		info, err := entry.Info()
 		if err != nil {
-			return err
+			return nil, err
 		}
-		if info.IsDir() {
-			return nil
-		}
-		name := strings.TrimPrefix(path, s.Path)
-		localObjects[name] = info
-		return nil
-	})
-	return localObjects, err
+		localObjects[entry.Name()] = info
+	}
+	return localObjects, nil
+}
+
+// validName is name that does not include `/` (since subdirectories are not allowed)
+// nor matches usual filenames that exist inside any folder (. or ..)
+func (s *S3DownloadSync) validName(name string) bool {
+	if name != "" && name != "." && name != ".." && !strings.Contains(name, "/") {
+		return true
+	}
+	s.logger.Printf("Skipping key %q: it's not a file directly under the prefix", s.Prefix+name)
+	return false
 }
 
 func (s *S3DownloadSync) remoteObjects() (map[string]*RemoteObjectInfo, error) {
@@ -459,6 +474,9 @@ func (s *S3DownloadSync) remoteObjects() (map[string]*RemoteObjectInfo, error) {
 		func(page *s3.ListObjectsV2Output, lastPage bool) bool {
 			for _, object := range page.Contents {
 				name := strings.TrimPrefix(*object.Key, s.Prefix)
+				if !s.validName(name) {
+					continue
+				}
 				remoteObjects[name] = &RemoteObjectInfo{
 					LastModified: object.LastModified,
 					Size:         object.Size,
@@ -478,20 +496,18 @@ func (s *S3DownloadSync) PartialSync(keys []string) (bool, error) {
 	localObjects := make(map[string]os.FileInfo)
 
 	for _, name := range keys {
-		localFile := s.Path + name
+		if !s.validName(name) {
+			continue
+		}
 
-		locInfo, err := os.Stat(localFile)
-		if err != nil {
-			if os.IsNotExist(err) {
-				continue
-			}
+		// a map that isn't there yet still has to be checked in S3
+		locInfo, err := os.Stat(filepath.Join(s.Path, name))
+		if err == nil {
+			localObjects[name] = locInfo
+		} else if !os.IsNotExist(err) {
 			return false, err
 		}
 
-		localObjects[name] = locInfo
-	}
-
-	for _, name := range keys {
 		objKey := s.Prefix + name
 		headOptions := &s3.HeadObjectInput{
 			Bucket: aws.String(s.Bucket),
@@ -565,7 +581,7 @@ func (s *S3DownloadSync) executeSync(plan SyncPlan) error {
 	}()
 
 	for _, item := range plan {
-		localFile := s.Path + item.Name
+		localFile := filepath.Join(s.Path, item.Name)
 
 		if item.Action == RemoveAction {
 			// nothing to download
