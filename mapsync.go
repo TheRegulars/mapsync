@@ -459,7 +459,7 @@ func (s *S3DownloadSync) remoteObjects() (map[string]*RemoteObjectInfo, error) {
 					Size:         object.Size,
 				}
 			}
-			return false
+			return !lastPage
 		})
 
 	return remoteObjects, err
