@@ -4,13 +4,6 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
-	aws_ev "github.com/aws/aws-lambda-go/events"
-	"github.com/aws/aws-sdk-go/aws"
-	"github.com/aws/aws-sdk-go/aws/awserr"
-	"github.com/aws/aws-sdk-go/aws/session"
-	"github.com/aws/aws-sdk-go/service/s3"
-	"github.com/aws/aws-sdk-go/service/s3/s3manager"
-	"github.com/aws/aws-sdk-go/service/sqs"
 	"io/ioutil"
 	"log"
 	"math"
@@ -21,6 +14,14 @@ import (
 	"sync"
 	"syscall"
 	"time"
+
+	aws_ev "github.com/aws/aws-lambda-go/events"
+	"github.com/aws/aws-sdk-go/aws"
+	"github.com/aws/aws-sdk-go/aws/awserr"
+	"github.com/aws/aws-sdk-go/aws/session"
+	"github.com/aws/aws-sdk-go/service/s3"
+	"github.com/aws/aws-sdk-go/service/s3/s3manager"
+	"github.com/aws/aws-sdk-go/service/sqs"
 )
 
 type FileAction int
@@ -87,7 +88,6 @@ type RemoteObjectInfo struct {
 type SyncPlan []*LocalFileChange
 
 func compareFileObjects(remoteObj *RemoteObjectInfo, localObj os.FileInfo) bool {
-
 	if remoteObj.LastModified == nil || remoteObj.Size == nil {
 		// if object have no date or size assume that it was changed
 		return false
@@ -98,10 +98,16 @@ func compareFileObjects(remoteObj *RemoteObjectInfo, localObj os.FileInfo) bool 
 	return (sizeDiff == 0) && math.Abs(timeDiff.Seconds()) < 1
 }
 
-func NewSyncService(bucket, region, prefix, path, queue, fifoPath string) *SyncService {
-	sess := session.Must(session.NewSession(&aws.Config{
+func NewSyncService(endpoint, bucket, region, prefix, path, queue, fifoPath string) *SyncService {
+	config := &aws.Config{
 		Region: aws.String(region),
-	}))
+	}
+	if endpoint != "" {
+		// local AWS emulator (floci, ministack, etc)
+		config.Endpoint = aws.String(endpoint)
+		config.S3ForcePathStyle = aws.Bool(true)
+	}
+	sess := session.Must(session.NewSession(config))
 
 	logger := log.New(os.Stderr, "", 0)
 	s3Svc := s3.New(sess)
@@ -135,7 +141,6 @@ func NewSyncService(bucket, region, prefix, path, queue, fifoPath string) *SyncS
 
 func (s *SyncService) Sync() error {
 	changed, err := s.s3Sync.Sync()
-
 	if err != nil {
 		return err
 	}
@@ -150,7 +155,6 @@ func (s *SyncService) Sync() error {
 
 func (s *SyncService) PartialSync(keys []string) error {
 	changed, err := s.s3Sync.PartialSync(keys)
-
 	if err != nil {
 		return err
 	}
@@ -250,7 +254,6 @@ func (s *SyncService) ProcessMessages() {
 			QueueUrl:            aws.String(s.QueueUrl),
 		}
 		msgs, err := s.sqsSvc.ReceiveMessage(input)
-
 		if err != nil {
 			s.logger.Printf("Error during reading messages: %v", err)
 			time.Sleep(time.Second * 5)
@@ -270,7 +273,6 @@ func (s *SyncService) ProcessMessages() {
 				QueueUrl:      aws.String(s.QueueUrl),
 				ReceiptHandle: message.ReceiptHandle,
 			})
-
 			if err != nil {
 				s.logger.Printf("Error during removing message: %v", err)
 			}
@@ -310,8 +312,8 @@ func (s *SyncService) ProcessMessages() {
 }
 
 func createSyncPlan(remoteObjects map[string]*RemoteObjectInfo,
-	localObjects map[string]os.FileInfo) SyncPlan {
-
+	localObjects map[string]os.FileInfo,
+) SyncPlan {
 	fileChanges := make([]*LocalFileChange, 0, 256)
 	sortedKeys := make([]string, 0, len(remoteObjects))
 
@@ -351,7 +353,7 @@ func createSyncPlan(remoteObjects map[string]*RemoteObjectInfo,
 		}
 	}
 
-	for name, _ := range localObjects {
+	for name := range localObjects {
 		_, ok := remoteObjects[name]
 		if !ok {
 			action := &LocalFileChange{
@@ -366,8 +368,8 @@ func createSyncPlan(remoteObjects map[string]*RemoteObjectInfo,
 }
 
 func downloadObjectTask(downloader *s3manager.Downloader, jobs <-chan syncJob,
-	errors chan<- syncError, group *sync.WaitGroup) {
-
+	errors chan<- syncError, group *sync.WaitGroup,
+) {
 	var update bool
 	var err error
 
@@ -450,7 +452,6 @@ func (s *S3DownloadSync) remoteObjects() (map[string]*RemoteObjectInfo, error) {
 	// load list of remote objects
 	err := s.s3Service.ListObjectsV2Pages(bucketOptions,
 		func(page *s3.ListObjectsV2Output, lastPage bool) bool {
-
 			for _, object := range page.Contents {
 				name := strings.TrimPrefix(*object.Key, s.Prefix)
 				remoteObjects[name] = &RemoteObjectInfo{
@@ -519,10 +520,8 @@ func (s *S3DownloadSync) PartialSync(keys []string) (bool, error) {
 }
 
 func (s *S3DownloadSync) Sync() (bool, error) {
-
 	s.logger.Println("started sync")
 	localObjects, err := s.localObjects()
-
 	if err != nil {
 		return false, err
 	}
@@ -543,7 +542,6 @@ func (s *S3DownloadSync) Sync() (bool, error) {
 }
 
 func (s *S3DownloadSync) executeSync(plan SyncPlan) error {
-
 	downloader := s3manager.NewDownloaderWithClient(s.s3Service)
 
 	jobs := make(chan syncJob, s.concurrentFiles*6)
@@ -602,6 +600,7 @@ Used environment variables:
 	S3_BUCKET - bucket for sync
 	S3_PREFIX - bucket prefix
 	SQS_QUEUE_URL - url to queue with update events
+	AWS_ENDPOINT_URL - optional, endpoint of local AWS emulator for testing
 	AWS_DEFAULT_REGION
 	AWS_ACCESS_KEY_ID
 	AWS_SECRET_ACCESS_KEY
@@ -628,7 +627,9 @@ func main() {
 	region := loadParam("AWS_REGION")
 	prefix := loadParam("S3_PREFIX")
 	queueUrl := loadParam("SQS_QUEUE_URL")
+	// endpoint is optional parameter
+	endpoint := os.Getenv("AWS_ENDPOINT_URL")
 
-	service := NewSyncService(bucket, region, prefix, *pathPtr, queueUrl, *fifoPathPtr)
+	service := NewSyncService(endpoint, bucket, region, prefix, *pathPtr, queueUrl, *fifoPathPtr)
 	service.Start()
 }
