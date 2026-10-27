@@ -308,12 +308,14 @@ func (s *SyncService) ProcessMessages() {
 					continue
 				}
 
-				if strings.HasPrefix(item.S3.Object.Key, s.Prefix) {
+				// S3 URL-encodes keys in events, the library decodes them
+				objectKey := item.S3.Object.URLDecodedKey
+				if strings.HasPrefix(objectKey, s.Prefix) {
 					// good message
 					s.logger.Printf("Received change event: %s, type: %s, ip %s",
-						item.S3.Object.Key, item.EventName,
+						objectKey, item.EventName,
 						item.RequestParameters.SourceIPAddress)
-					key := strings.TrimPrefix(item.S3.Object.Key, s.Prefix)
+					key := strings.TrimPrefix(objectKey, s.Prefix)
 					s.addChange(key)
 				}
 			}
