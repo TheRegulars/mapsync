@@ -13,6 +13,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -76,7 +77,7 @@ type SyncService struct {
 	logger       *log.Logger
 	lastFullSync time.Time
 	lastSync     time.Time
-	lastChange   time.Time
+	lastChange   atomic.Pointer[time.Time]
 	changes      []string
 	changesMutex sync.Mutex
 }
@@ -190,7 +191,8 @@ func (s *SyncService) periodicSync() {
 	for {
 		select {
 		case <-changesTicker.C:
-			if s.lastChange.IsZero() || time.Since(s.lastChange) < time.Second*90 {
+			lastChange := s.lastChange.Load()
+			if lastChange == nil || time.Since(*lastChange) < time.Second*90 {
 				// wait till there will 90 seconds after last change
 				// this will agregate multiple changes
 				// and will give some time to undo changes
@@ -251,9 +253,11 @@ func (s *SyncService) AfterSyncChanges() {
 }
 
 func (s *SyncService) addChange(key string) {
+	now := time.Now()
+	s.lastChange.Store(&now)
+
 	s.changesMutex.Lock()
 	s.changes = append(s.changes, key)
-	s.lastChange = time.Now()
 	s.changesMutex.Unlock()
 }
 
