@@ -272,16 +272,12 @@ func (s *SyncService) ProcessMessages() {
 		input := &sqs.ReceiveMessageInput{
 			MaxNumberOfMessages: 10,
 			QueueUrl:            aws.String(s.QueueUrl),
+			WaitTimeSeconds:     20,
 		}
 		msgs, err := s.sqsSvc.ReceiveMessage(context.Background(), input)
 		if err != nil {
 			s.logger.Printf("Error during reading messages: %v", err)
 			time.Sleep(time.Second * 5)
-			continue
-		}
-
-		if len(msgs.Messages) < 1 {
-			time.Sleep(time.Second * 7)
 			continue
 		}
 
