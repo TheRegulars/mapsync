@@ -1,9 +1,12 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"io/ioutil"
 	"log"
 	"math"
@@ -18,12 +21,11 @@ import (
 	"time"
 
 	aws_ev "github.com/aws/aws-lambda-go/events"
-	"github.com/aws/aws-sdk-go/aws"
-	"github.com/aws/aws-sdk-go/aws/awserr"
-	"github.com/aws/aws-sdk-go/aws/session"
-	"github.com/aws/aws-sdk-go/service/s3"
-	"github.com/aws/aws-sdk-go/service/s3/s3manager"
-	"github.com/aws/aws-sdk-go/service/sqs"
+	"github.com/aws/aws-sdk-go-v2/aws"
+	"github.com/aws/aws-sdk-go-v2/config"
+	"github.com/aws/aws-sdk-go-v2/service/s3"
+	"github.com/aws/aws-sdk-go-v2/service/s3/types"
+	"github.com/aws/aws-sdk-go-v2/service/sqs"
 )
 
 type FileAction int
@@ -58,9 +60,9 @@ type S3DownloadSync struct {
 	Region          string
 	Prefix          string
 	Path            string
-	maxKeys         int64
+	maxKeys         int32
 	concurrentFiles int
-	s3Service       *s3.S3
+	s3Service       *s3.Client
 	logger          *log.Logger
 }
 
@@ -72,8 +74,7 @@ type SyncService struct {
 	QueueUrl     string
 	FIFOPath     string
 	s3Sync       *S3DownloadSync
-	session      *session.Session
-	sqsSvc       *sqs.SQS
+	sqsSvc       *sqs.Client
 	logger       *log.Logger
 	lastFullSync time.Time
 	lastSync     time.Time
@@ -105,19 +106,25 @@ func NewSyncService(endpoint, bucket, region, prefix, path, queue, fifoPath stri
 		prefix += "/"
 	}
 
-	config := &aws.Config{
-		Region: aws.String(region),
+	logger := log.New(os.Stderr, "", 0)
+	cfg, err := config.LoadDefaultConfig(
+		context.Background(),
+		config.WithRegion(region),
+		// an empty list, unlike nil, means that no ~/.aws/config is read
+		config.WithSharedConfigFiles([]string{}),
+	)
+	if err != nil {
+		logger.Fatalf("Can't load AWS config: %v", err)
 	}
 	if endpoint != "" {
 		// local AWS emulator (floci, ministack, etc)
-		config.Endpoint = aws.String(endpoint)
-		config.S3ForcePathStyle = aws.Bool(true)
+		cfg.BaseEndpoint = aws.String(endpoint)
 	}
-	sess := session.Must(session.NewSession(config))
 
-	logger := log.New(os.Stderr, "", 0)
-	s3Svc := s3.New(sess)
-	sqsSvc := sqs.New(sess)
+	s3Svc := s3.NewFromConfig(cfg, func(o *s3.Options) {
+		o.UsePathStyle = endpoint != ""
+	})
+	sqsSvc := sqs.NewFromConfig(cfg)
 
 	downloadSync := &S3DownloadSync{
 		Bucket:          bucket,
@@ -138,7 +145,6 @@ func NewSyncService(endpoint, bucket, region, prefix, path, queue, fifoPath stri
 		QueueUrl: queue,
 		FIFOPath: fifoPath,
 		s3Sync:   downloadSync,
-		session:  sess,
 		sqsSvc:   sqsSvc,
 		changes:  make([]string, 0, 256),
 		logger:   logger,
@@ -264,10 +270,10 @@ func (s *SyncService) addChange(key string) {
 func (s *SyncService) ProcessMessages() {
 	for {
 		input := &sqs.ReceiveMessageInput{
-			MaxNumberOfMessages: aws.Int64(10),
+			MaxNumberOfMessages: 10,
 			QueueUrl:            aws.String(s.QueueUrl),
 		}
-		msgs, err := s.sqsSvc.ReceiveMessage(input)
+		msgs, err := s.sqsSvc.ReceiveMessage(context.Background(), input)
 		if err != nil {
 			s.logger.Printf("Error during reading messages: %v", err)
 			time.Sleep(time.Second * 5)
@@ -283,7 +289,7 @@ func (s *SyncService) ProcessMessages() {
 			var snsMessage aws_ev.SNSEntity
 			var s3Event aws_ev.S3Event
 
-			_, err := s.sqsSvc.DeleteMessage(&sqs.DeleteMessageInput{
+			_, err := s.sqsSvc.DeleteMessage(context.Background(), &sqs.DeleteMessageInput{
 				QueueUrl:      aws.String(s.QueueUrl),
 				ReceiptHandle: message.ReceiptHandle,
 			})
@@ -395,7 +401,17 @@ func createTempFile(filename string) (*os.File, error) {
 	}
 }
 
-func downloadObject(downloader *s3manager.Downloader, task syncJob) (err error) {
+func writeObject(client *s3.Client, object *s3.GetObjectInput, w io.Writer) error {
+	resp, err := client.GetObject(context.Background(), object)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	_, err = io.Copy(w, resp.Body)
+	return err
+}
+
+func downloadObject(client *s3.Client, task syncJob) (err error) {
 	file, err := createTempFile(task.filename)
 	if err != nil {
 		return err
@@ -406,7 +422,7 @@ func downloadObject(downloader *s3manager.Downloader, task syncJob) (err error) 
 		}
 	}()
 
-	_, err = downloader.Download(file, task.object)
+	err = writeObject(client, task.object, file)
 	closeErr := file.Close()
 	if err != nil {
 		return err
@@ -420,11 +436,11 @@ func downloadObject(downloader *s3manager.Downloader, task syncJob) (err error) 
 	return os.Rename(file.Name(), task.filename)
 }
 
-func downloadObjectTask(downloader *s3manager.Downloader, jobs <-chan syncJob,
+func downloadObjectTask(client *s3.Client, jobs <-chan syncJob,
 	errors chan<- syncError, group *sync.WaitGroup,
 ) {
 	for task := range jobs {
-		if err := downloadObject(downloader, task); err != nil {
+		if err := downloadObject(client, task); err != nil {
 			errors <- syncError{
 				key:      task.key,
 				filename: task.filename,
@@ -472,26 +488,29 @@ func (s *S3DownloadSync) remoteObjects() (map[string]*RemoteObjectInfo, error) {
 	bucketOptions := &s3.ListObjectsV2Input{
 		Bucket:  aws.String(s.Bucket),
 		Prefix:  aws.String(s.Prefix),
-		MaxKeys: aws.Int64(s.maxKeys),
+		MaxKeys: aws.Int32(s.maxKeys),
 	}
 
 	// load list of remote objects
-	err := s.s3Service.ListObjectsV2Pages(bucketOptions,
-		func(page *s3.ListObjectsV2Output, lastPage bool) bool {
-			for _, object := range page.Contents {
-				name := strings.TrimPrefix(*object.Key, s.Prefix)
-				if !s.validName(name) {
-					continue
-				}
-				remoteObjects[name] = &RemoteObjectInfo{
-					LastModified: object.LastModified,
-					Size:         object.Size,
-				}
+	pages := s3.NewListObjectsV2Paginator(s.s3Service, bucketOptions)
+	for pages.HasMorePages() {
+		page, err := pages.NextPage(context.Background())
+		if err != nil {
+			return nil, err
+		}
+		for _, object := range page.Contents {
+			name := strings.TrimPrefix(*object.Key, s.Prefix)
+			if !s.validName(name) {
+				continue
 			}
-			return !lastPage
-		})
+			remoteObjects[name] = &RemoteObjectInfo{
+				LastModified: object.LastModified,
+				Size:         object.Size,
+			}
+		}
+	}
 
-	return remoteObjects, err
+	return remoteObjects, nil
 }
 
 func (s *S3DownloadSync) PartialSync(keys []string) (bool, error) {
@@ -520,15 +539,14 @@ func (s *S3DownloadSync) PartialSync(keys []string) (bool, error) {
 			Key:    aws.String(objKey),
 		}
 
-		resp, err := s.s3Service.HeadObject(headOptions)
+		resp, err := s.s3Service.HeadObject(context.Background(), headOptions)
 		// process errors
 		if err != nil {
-			aerr, ok := err.(awserr.Error)
-			if ok && aerr.Code() == "NotFound" {
+			var notFound *types.NotFound
+			if errors.As(err, &notFound) {
 				continue
-			} else {
-				return false, err
 			}
+			return false, err
 		}
 		remoteObjects[name] = &RemoteObjectInfo{
 			LastModified: resp.LastModified,
@@ -569,14 +587,12 @@ func (s *S3DownloadSync) Sync() (bool, error) {
 }
 
 func (s *S3DownloadSync) executeSync(plan SyncPlan) error {
-	downloader := s3manager.NewDownloaderWithClient(s.s3Service)
-
 	jobs := make(chan syncJob, s.concurrentFiles*6)
 	errors := make(chan syncError, 10)
 	waitGroup := &sync.WaitGroup{}
 
 	for i := 0; i < s.concurrentFiles; i++ {
-		go downloadObjectTask(downloader, jobs, errors, waitGroup)
+		go downloadObjectTask(s.s3Service, jobs, errors, waitGroup)
 	}
 	waitGroup.Add(s.concurrentFiles)
 
