@@ -11,6 +11,7 @@ import (
 	"math"
 	"math/rand/v2"
 	"os"
+	"os/signal"
 	"path/filepath"
 	"sort"
 	"strings"
@@ -33,6 +34,11 @@ const (
 	DownloadAction FileAction = 0
 	UpdateAction   FileAction = 1
 	RemoveAction   FileAction = 2
+)
+
+const (
+	downloadTimeout = 15 * time.Minute
+	requestTimeout  = time.Minute
 )
 
 type LocalFileChange struct {
@@ -150,8 +156,8 @@ func NewSyncService(endpoint, bucket, region, prefix, path, queue, fifoPath stri
 	}
 }
 
-func (s *SyncService) Sync() error {
-	changed, err := s.s3Sync.Sync()
+func (s *SyncService) Sync(ctx context.Context) error {
+	changed, err := s.s3Sync.Sync(ctx)
 	if err != nil {
 		return err
 	}
@@ -164,8 +170,8 @@ func (s *SyncService) Sync() error {
 	return nil
 }
 
-func (s *SyncService) PartialSync(keys []string) error {
-	changed, err := s.s3Sync.PartialSync(keys)
+func (s *SyncService) PartialSync(ctx context.Context, keys []string) error {
+	changed, err := s.s3Sync.PartialSync(ctx, keys)
 	if err != nil {
 		return err
 	}
@@ -177,17 +183,22 @@ func (s *SyncService) PartialSync(keys []string) error {
 	return nil
 }
 
-func (s *SyncService) Start() {
+// Start syncs until ctx is cancelled. Then it stops everything but the
+// downloads in progress, and returns once they are finished.
+func (s *SyncService) Start(ctx context.Context) {
 	// initial sync
-	err := s.Sync()
-	if err != nil {
+	err := s.Sync(ctx)
+	if err != nil && ctx.Err() == nil {
 		s.logger.Fatalf("Initial sync failed: %v", err)
 	}
-	go s.periodicSync()
-	s.ProcessMessages()
+
+	var group sync.WaitGroup
+	group.Go(func() { s.periodicSync(ctx) })
+	group.Go(func() { s.ProcessMessages(ctx) })
+	group.Wait()
 }
 
-func (s *SyncService) periodicSync() {
+func (s *SyncService) periodicSync(ctx context.Context) {
 	changesTicker := time.NewTicker(time.Second * 30)
 	defer changesTicker.Stop()
 	fullSyncTicker := time.NewTicker(time.Hour * 3)
@@ -195,6 +206,8 @@ func (s *SyncService) periodicSync() {
 
 	for {
 		select {
+		case <-ctx.Done():
+			return
 		case <-changesTicker.C:
 			lastChange := s.lastChange.Load()
 			if lastChange == nil || time.Since(*lastChange) < time.Second*90 {
@@ -216,13 +229,13 @@ func (s *SyncService) periodicSync() {
 			s.changes = s.changes[:0]
 			s.changesMutex.Unlock()
 
-			if err := s.PartialSync(keys); err != nil {
+			if err := s.PartialSync(ctx, keys); err != nil && ctx.Err() == nil {
 				s.logger.Printf("Failed partial sync: %v", err)
 			}
 		case <-fullSyncTicker.C:
 			// full sync
 			if time.Since(s.lastFullSync) > 24*time.Hour && time.Since(s.lastSync) > 2*time.Hour {
-				if err := s.Sync(); err != nil {
+				if err := s.Sync(ctx); err != nil && ctx.Err() == nil {
 					s.logger.Printf("Failed to sync: %v", err)
 				}
 			}
@@ -266,17 +279,25 @@ func (s *SyncService) addChange(key string) {
 	s.changesMutex.Unlock()
 }
 
-func (s *SyncService) ProcessMessages() {
-	for {
+func (s *SyncService) ProcessMessages(ctx context.Context) {
+	for ctx.Err() == nil {
 		input := &sqs.ReceiveMessageInput{
 			MaxNumberOfMessages: 10,
 			QueueUrl:            aws.String(s.QueueUrl),
 			WaitTimeSeconds:     20,
 		}
-		msgs, err := s.sqsSvc.ReceiveMessage(context.Background(), input)
+		receiveCtx, cancel := context.WithTimeout(ctx, requestTimeout)
+		msgs, err := s.sqsSvc.ReceiveMessage(receiveCtx, input)
+		cancel()
 		if err != nil {
+			if ctx.Err() != nil {
+				return
+			}
 			s.logger.Printf("Error during reading messages: %v", err)
-			time.Sleep(time.Second * 5)
+			select {
+			case <-ctx.Done():
+			case <-time.After(time.Second * 5):
+			}
 			continue
 		}
 
@@ -284,10 +305,12 @@ func (s *SyncService) ProcessMessages() {
 			var snsMessage aws_ev.SNSEntity
 			var s3Event aws_ev.S3Event
 
-			_, err := s.sqsSvc.DeleteMessage(context.Background(), &sqs.DeleteMessageInput{
+			deleteCtx, cancel := context.WithTimeout(ctx, requestTimeout)
+			_, err := s.sqsSvc.DeleteMessage(deleteCtx, &sqs.DeleteMessageInput{
 				QueueUrl:      aws.String(s.QueueUrl),
 				ReceiptHandle: message.ReceiptHandle,
 			})
+			cancel()
 			if err != nil {
 				s.logger.Printf("Error during removing message: %v", err)
 			}
@@ -401,7 +424,9 @@ func createTempFile(filename string) (*os.File, error) {
 }
 
 func writeObject(client *s3.Client, object *s3.GetObjectInput, w io.Writer) error {
-	resp, err := client.GetObject(context.Background(), object)
+	ctx, cancel := context.WithTimeout(context.Background(), downloadTimeout)
+	defer cancel()
+	resp, err := client.GetObject(ctx, object)
 	if err != nil {
 		return err
 	}
@@ -435,10 +460,15 @@ func downloadObject(client *s3.Client, task syncJob) (err error) {
 	return os.Rename(file.Name(), task.filename)
 }
 
-func downloadObjectTask(client *s3.Client, jobs <-chan syncJob,
+// downloadObjectTask downloads the jobs until ctx is cancelled, then it skips
+// the rest of them. A download in progress isn't cancelled with ctx.
+func downloadObjectTask(ctx context.Context, client *s3.Client, jobs <-chan syncJob,
 	errors chan<- syncError, group *sync.WaitGroup,
 ) {
 	for task := range jobs {
+		if ctx.Err() != nil {
+			continue
+		}
 		if err := downloadObject(client, task); err != nil {
 			errors <- syncError{
 				key:      task.key,
@@ -486,7 +516,7 @@ func (s *S3DownloadSync) validName(name string) bool {
 	return true
 }
 
-func (s *S3DownloadSync) remoteObjects() (map[string]*RemoteObjectInfo, error) {
+func (s *S3DownloadSync) remoteObjects(ctx context.Context) (map[string]*RemoteObjectInfo, error) {
 	remoteObjects := make(map[string]*RemoteObjectInfo)
 
 	bucketOptions := &s3.ListObjectsV2Input{
@@ -498,7 +528,9 @@ func (s *S3DownloadSync) remoteObjects() (map[string]*RemoteObjectInfo, error) {
 	// load list of remote objects
 	pages := s3.NewListObjectsV2Paginator(s.s3Service, bucketOptions)
 	for pages.HasMorePages() {
-		page, err := pages.NextPage(context.Background())
+		pageCtx, cancel := context.WithTimeout(ctx, requestTimeout)
+		page, err := pages.NextPage(pageCtx)
+		cancel()
 		if err != nil {
 			return nil, err
 		}
@@ -517,7 +549,7 @@ func (s *S3DownloadSync) remoteObjects() (map[string]*RemoteObjectInfo, error) {
 	return remoteObjects, nil
 }
 
-func (s *S3DownloadSync) PartialSync(keys []string) (bool, error) {
+func (s *S3DownloadSync) PartialSync(ctx context.Context, keys []string) (bool, error) {
 	// TODO: log more
 	s.logger.Println("started partial sync")
 
@@ -543,7 +575,9 @@ func (s *S3DownloadSync) PartialSync(keys []string) (bool, error) {
 			Key:    aws.String(objKey),
 		}
 
-		resp, err := s.s3Service.HeadObject(context.Background(), headOptions)
+		headCtx, cancel := context.WithTimeout(ctx, requestTimeout)
+		resp, err := s.s3Service.HeadObject(headCtx, headOptions)
+		cancel()
 		// process errors
 		if err != nil {
 			var notFound *types.NotFound
@@ -564,18 +598,18 @@ func (s *S3DownloadSync) PartialSync(keys []string) (bool, error) {
 		s.logger.Println("done, nothing changed")
 		return false, nil
 	} else {
-		return true, s.executeSync(plan)
+		return true, s.executeSync(ctx, plan)
 	}
 }
 
-func (s *S3DownloadSync) Sync() (bool, error) {
+func (s *S3DownloadSync) Sync(ctx context.Context) (bool, error) {
 	s.logger.Println("started sync")
 	localObjects, err := s.localObjects()
 	if err != nil {
 		return false, err
 	}
 
-	remoteObjects, err := s.remoteObjects()
+	remoteObjects, err := s.remoteObjects(ctx)
 	if err != nil {
 		return false, err
 	}
@@ -587,26 +621,32 @@ func (s *S3DownloadSync) Sync() (bool, error) {
 		return false, nil
 	}
 
-	return true, s.executeSync(plan)
+	return true, s.executeSync(ctx, plan)
 }
 
-func (s *S3DownloadSync) executeSync(plan SyncPlan) error {
+func (s *S3DownloadSync) executeSync(ctx context.Context, plan SyncPlan) error {
 	jobs := make(chan syncJob, s.concurrentFiles*6)
 	errors := make(chan syncError, 10)
 	waitGroup := &sync.WaitGroup{}
-
-	for i := 0; i < s.concurrentFiles; i++ {
-		go downloadObjectTask(s.s3Service, jobs, errors, waitGroup)
-	}
 	waitGroup.Add(s.concurrentFiles)
 
+	for i := 0; i < s.concurrentFiles; i++ {
+		go downloadObjectTask(ctx, s.s3Service, jobs, errors, waitGroup)
+	}
+
+	errorsLogged := make(chan struct{})
 	go func() {
 		for item := range errors {
 			s.logger.Printf("Error during processing %s: %v", item.key, item.err)
 		}
+		close(errorsLogged)
 	}()
 
 	for _, item := range plan {
+		if ctx.Err() != nil {
+			// shutting down, the rest is left to the next sync
+			break
+		}
 		localFile := filepath.Join(s.Path, item.Name)
 
 		if item.Action == RemoveAction {
@@ -627,16 +667,20 @@ func (s *S3DownloadSync) executeSync(plan SyncPlan) error {
 
 		s.logger.Printf("Sync file: %s", item.Name)
 
-		jobs <- syncJob{
+		select {
+		case jobs <- syncJob{
 			object:   obj,
 			filename: localFile,
 			key:      item.Name,
 			mtime:    item.MTime.Local(),
+		}:
+		case <-ctx.Done():
 		}
 	}
 	close(jobs)
 	waitGroup.Wait()
 	close(errors)
+	<-errorsLogged
 	s.logger.Println("done, sync ended")
 	return nil
 }
@@ -678,5 +722,20 @@ func main() {
 	endpoint := os.Getenv("AWS_ENDPOINT_URL")
 
 	service := NewSyncService(endpoint, bucket, region, prefix, *pathPtr, queueUrl, *fifoPathPtr)
-	service.Start()
+
+	// the first SIGTERM or SIGINT stops mapsync once the downloads in progress
+	// are finished, the second one terminates it immediately
+	ctx, cancel := context.WithCancel(context.Background())
+	signals := make(chan os.Signal, 1)
+	signal.Notify(signals, syscall.SIGTERM, syscall.SIGINT)
+	go func() {
+		sig := <-signals
+		// back to the default handling, which terminates the process
+		signal.Stop(signals)
+		service.logger.Printf("Shutting down (%v), waiting for the downloads in progress", sig)
+		cancel()
+	}()
+
+	service.Start(ctx)
+	service.logger.Println("Stopped")
 }
