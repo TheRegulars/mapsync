@@ -7,7 +7,6 @@ import (
 	"flag"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"log"
 	"math"
 	"math/rand/v2"
@@ -234,14 +233,14 @@ func (s *SyncService) periodicSync() {
 func (s *SyncService) AfterSyncChanges() {
 	const rescan = "rescan_pending 1\n"
 
-	files, err := ioutil.ReadDir(s.FIFOPath)
+	files, err := os.ReadDir(s.FIFOPath)
 	if err != nil {
 		s.logger.Printf("Can't list FIFO directory %v", err)
 		return
 	}
 
 	for _, file := range files {
-		if file.Mode()&os.ModeNamedPipe == 0 {
+		if file.Type()&os.ModeNamedPipe == 0 {
 			continue
 		}
 		filename := filepath.Join(s.FIFOPath, file.Name())
