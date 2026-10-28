@@ -384,6 +384,10 @@ func createSyncPlan(remoteObjects map[string]*RemoteObjectInfo,
 	return fileChanges
 }
 
+// maxNameLen is the longest name whose temp file (see createTempFile) still
+// fits into the 255-byte file name limit of Linux file systems.
+const maxNameLen = 255 - len(".") - len(".4294967295.tmp")
+
 func createTempFile(filename string) (*os.File, error) {
 	dir, base := filepath.Split(filename)
 	for {
@@ -469,12 +473,17 @@ func (s *S3DownloadSync) localObjects() (map[string]os.FileInfo, error) {
 
 // validName is name that does not include `/` (since subdirectories are not allowed)
 // nor matches usual filenames that exist inside any folder (. or ..)
+// and isn't longer than maxNameLen bytes
 func (s *S3DownloadSync) validName(name string) bool {
-	if name != "" && name != "." && name != ".." && !strings.Contains(name, "/") {
-		return true
+	if name == "" || name == "." || name == ".." || strings.Contains(name, "/") {
+		s.logger.Printf("Skipping key %q: it's not a file directly under the prefix", s.Prefix+name)
+		return false
 	}
-	s.logger.Printf("Skipping key %q: it's not a file directly under the prefix", s.Prefix+name)
-	return false
+	if len(name) > maxNameLen {
+		s.logger.Printf("Skipping key %q: its name is longer than %d bytes", s.Prefix+name, maxNameLen)
+		return false
+	}
+	return true
 }
 
 func (s *S3DownloadSync) remoteObjects() (map[string]*RemoteObjectInfo, error) {
