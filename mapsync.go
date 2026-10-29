@@ -86,6 +86,7 @@ type SyncService struct {
 	lastChange   atomic.Pointer[time.Time]
 	changes      []string
 	changesMutex sync.Mutex
+	fullSync     chan struct{}
 }
 
 type RemoteObjectInfo struct {
@@ -153,6 +154,7 @@ func NewSyncService(endpoint, bucket, region, prefix, path, queue, fifoPath stri
 		sqsSvc:   sqsSvc,
 		changes:  make([]string, 0, 256),
 		logger:   logger,
+		fullSync: make(chan struct{}, 1),
 	}
 }
 
@@ -198,6 +200,14 @@ func (s *SyncService) Start(ctx context.Context) {
 	group.Wait()
 }
 
+func (s *SyncService) RequestFullSync() {
+	select {
+	case s.fullSync <- struct{}{}:
+	default:
+		// a full sync is requested already
+	}
+}
+
 func (s *SyncService) periodicSync(ctx context.Context) {
 	changesTicker := time.NewTicker(time.Second * 30)
 	defer changesTicker.Stop()
@@ -238,6 +248,10 @@ func (s *SyncService) periodicSync(ctx context.Context) {
 				if err := s.Sync(ctx); err != nil && ctx.Err() == nil {
 					s.logger.Printf("Failed to sync: %v", err)
 				}
+			}
+		case <-s.fullSync:
+			if err := s.Sync(ctx); err != nil && ctx.Err() == nil {
+				s.logger.Printf("Failed to sync: %v", err)
 			}
 		}
 	}
@@ -696,6 +710,11 @@ Used environment variables:
 	AWS_ACCESS_KEY_ID
 	AWS_SECRET_ACCESS_KEY
 
+Signals:
+	SIGHUP - do a full sync
+	SIGTERM, SIGINT - stop once the downloads in progress are finished, the
+		second one stops immediately
+
 Usage example:
 	mapsync -path /opt/xonotic/maps/
 */
@@ -734,6 +753,15 @@ func main() {
 		signal.Stop(signals)
 		service.logger.Printf("Shutting down (%v), waiting for the downloads in progress", sig)
 		cancel()
+	}()
+
+	hangups := make(chan os.Signal, 1)
+	signal.Notify(hangups, syscall.SIGHUP)
+	go func() {
+		for sig := range hangups {
+			service.logger.Printf("Full sync requested (%v)", sig)
+			service.RequestFullSync()
+		}
 	}()
 
 	service.Start(ctx)
